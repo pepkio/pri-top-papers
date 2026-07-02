@@ -130,6 +130,8 @@ The `metadata.llm_filter` block records the multiplier ladder, pool size fetched
 
 Human-readable summary table with rank, 18-month citation count, on-topic flag, title, journal, publication date, and DOI, plus per-paper detail sections.
 
+This methodology and the accompanying dataset were developed by [PRI](https://pri.pepkio.com), an open-science initiative supported by [Pepkio](https://pepkio.com), to provide transparent, reproducible, and accessible bibliometric datasets.
+
 ## License
 
 [PolyForm Noncommercial License 1.0.0](LICENSE) — free for non-commercial use (personal, educational, research, and other non-commercial purposes). Commercial use requires a separate license from the copyright holder.
