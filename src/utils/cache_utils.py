@@ -4,15 +4,18 @@ Generic async caching utilities.
 This module provides decorators for caching async function results.
 """
 
-import asyncio
 import hashlib
 import json
 import os
 import pickle
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, Optional
 from datetime import datetime, timedelta
+
+DEFAULT_LLM_CACHE_TTL_SECONDS = 604800  # 7 days
+LLM_CACHE_DIR = ".cache/llm"
+_llm_cache_disabled_override: bool | None = None
 
 
 class AsyncCache:
@@ -121,8 +124,40 @@ class AsyncCache:
             cache_file.unlink(missing_ok=True)
 
 
-# Global cache instance
+# Global cache instances
 _cache = AsyncCache()
+_llm_cache = AsyncCache(
+    cache_dir=LLM_CACHE_DIR,
+    default_ttl=DEFAULT_LLM_CACHE_TTL_SECONDS,
+)
+
+
+def is_llm_cache_disabled() -> bool:
+    """Return True when LLM response caching should be bypassed."""
+    if _llm_cache_disabled_override is not None:
+        return _llm_cache_disabled_override
+    return (os.getenv("LLM_CACHE_DISABLED") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def set_llm_cache_disabled(disabled: bool) -> None:
+    """Enable or disable LLM response caching for the current process."""
+    global _llm_cache_disabled_override
+    _llm_cache_disabled_override = disabled
+
+
+def llm_cache_ttl_seconds() -> int:
+    """Resolve TTL for cached LLM responses."""
+    raw = (os.getenv("LLM_CACHE_TTL_SECONDS") or "").strip()
+    if not raw:
+        return DEFAULT_LLM_CACHE_TTL_SECONDS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_LLM_CACHE_TTL_SECONDS
 
 
 def async_cache(
@@ -175,21 +210,65 @@ def async_cache(
     return decorator
 
 
+def llm_async_cache(
+    prefix: str = "",
+    ttl: Optional[int] = None,
+    key_func: Optional[Callable] = None,
+) -> Callable:
+    """Cache decorator for LLM calls stored under ``.cache/llm/``."""
+    resolved_ttl = llm_cache_ttl_seconds() if ttl is None else ttl
+
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            if is_llm_cache_disabled() or resolved_ttl <= 0:
+                return await func(*args, **kwargs)
+
+            if key_func:
+                cache_key = key_func(func, args, kwargs)
+            else:
+                func_name = f"{prefix}:{func.__name__}" if prefix else func.__name__
+                cache_key = _llm_cache._get_cache_key(func_name, args, kwargs)
+
+            cached_result = _llm_cache.get(cache_key)
+            if cached_result is not None:
+                return cached_result
+
+            result = await func(*args, **kwargs)
+            _llm_cache.set(cache_key, result, resolved_ttl)
+            return result
+
+        return wrapper
+
+    return decorator
+
+
 def clear_cache() -> None:
     """Clear all cached results."""
     _cache.clear()
+
+
+def clear_llm_cache() -> None:
+    """Clear cached LLM responses."""
+    _llm_cache.clear()
 
 
 def get_cache_stats() -> Dict[str, Any]:
     """Get cache statistics."""
     cache_files = list(_cache.cache_dir.glob("*.pkl"))
     total_size = sum(f.stat().st_size for f in cache_files if f.exists())
+    llm_cache_files = list(_llm_cache.cache_dir.glob("*.pkl"))
+    llm_total_size = sum(f.stat().st_size for f in llm_cache_files if f.exists())
 
     return {
         "cache_dir": str(_cache.cache_dir),
         "total_files": len(cache_files),
         "total_size_bytes": total_size,
         "total_size_mb": total_size / (1024 * 1024),
+        "llm_cache_dir": str(_llm_cache.cache_dir),
+        "llm_total_files": len(llm_cache_files),
+        "llm_total_size_bytes": llm_total_size,
+        "llm_total_size_mb": llm_total_size / (1024 * 1024),
     }
 
 

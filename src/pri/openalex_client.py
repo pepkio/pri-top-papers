@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import calendar
+import fcntl
 import json
 import math
 import os
+import sys
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 from dotenv import load_dotenv
@@ -20,6 +23,9 @@ DEFAULT_PER_PAGE = 25
 MAX_PER_PAGE = 200
 CITATION_WINDOW_MONTHS = 18
 CITATION_CACHE_TTL_DAYS = 7
+GET_MAX_ATTEMPTS = 5
+GET_BACKOFF_SECONDS = 2.0
+GET_TIMEOUT_SECONDS = 60
 
 _citation_cache: dict[str, Any] | None = None
 _citation_cache_stats = {"hits": 0, "misses": 0}
@@ -45,32 +51,60 @@ def _citation_cache_key(work_id: str, publication_date: str, months: int) -> str
     return f"{work_id}|{publication_date}|{months}"
 
 
-def _ensure_citation_cache_loaded() -> dict[str, Any]:
-    global _citation_cache
-    if _citation_cache is not None:
-        return _citation_cache
+def _citation_cache_lock_path() -> str:
+    return f"{citation_cache_path()}.lock"
+
+
+@contextmanager
+def _citation_cache_file_lock() -> Iterator[None]:
+    """Exclusive lock so parallel topic runs can safely update the shared cache."""
+    lock_path = _citation_cache_lock_path()
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _load_citation_cache_from_disk() -> dict[str, Any]:
     path = citation_cache_path()
     if os.path.isfile(path):
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                _citation_cache = data
-                return _citation_cache
+                return data
         except (json.JSONDecodeError, OSError):
             pass
-    _citation_cache = {}
+    return {}
+
+
+def _ensure_citation_cache_loaded() -> dict[str, Any]:
+    global _citation_cache
+    if _citation_cache is not None:
+        return _citation_cache
+    _citation_cache = _load_citation_cache_from_disk()
     return _citation_cache
 
 
 def _save_citation_cache(cache: dict[str, Any]) -> None:
     path = citation_cache_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(cache, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp_path, path)
+    tmp_path = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def _get_cached_citation_count(key: str) -> tuple[int, str] | None:
@@ -96,13 +130,17 @@ def _get_cached_citation_count(key: str) -> tuple[int, str] | None:
 
 
 def _set_cached_citation_count(key: str, count: int, window_end: str) -> None:
-    cache = _ensure_citation_cache_loaded()
-    cache[key] = {
+    global _citation_cache
+    entry = {
         "count": count,
         "window_end": window_end,
         "cached_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    _save_citation_cache(cache)
+    with _citation_cache_file_lock():
+        cache = _load_citation_cache_from_disk()
+        cache[key] = entry
+        _save_citation_cache(cache)
+        _citation_cache = cache
 
 
 def _headers() -> dict[str, str]:
@@ -114,9 +152,57 @@ def _headers() -> dict[str, str]:
 
 def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     url = f"{OPENALEX_BASE}/{path.lstrip('/')}"
-    response = requests.get(url, params=params, headers=_headers(), timeout=60)
-    response.raise_for_status()
-    return response.json()
+    last_error: BaseException | None = None
+    for attempt in range(GET_MAX_ATTEMPTS):
+        while True:
+            try:
+                response = requests.get(
+                    url,
+                    params=params,
+                    headers=_headers(),
+                    timeout=GET_TIMEOUT_SECONDS,
+                )
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last_error = exc
+                break
+
+            if response.status_code == 429:
+                last_error = requests.HTTPError(
+                    f"429 Client Error: Too Many Requests for url: {response.url}",
+                    response=response,
+                )
+                if attempt >= GET_MAX_ATTEMPTS - 1:
+                    raise last_error
+                break
+
+            try:
+                if response.status_code >= 500:
+                    response.raise_for_status()
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                last_error = exc
+                status = exc.response.status_code if exc.response is not None else None
+                if status is None or status < 500 or attempt >= GET_MAX_ATTEMPTS - 1:
+                    raise
+                break
+
+            return response.json()
+
+        if attempt >= GET_MAX_ATTEMPTS - 1:
+            if last_error:
+                raise last_error
+            raise RuntimeError("OpenAlex _get exhausted retries without raising")
+
+        delay = GET_BACKOFF_SECONDS * (2**attempt)
+        print(
+            f"  WARNING: OpenAlex API error ({last_error}); "
+            f"retrying in {delay:.0f}s "
+            f"(attempt {attempt + 1}/{GET_MAX_ATTEMPTS})",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+
+    raise RuntimeError("OpenAlex _get exhausted retries without raising") from last_error
 
 
 def search_topics(query: str, per_page: int = 5) -> list[dict[str, Any]]:
@@ -252,6 +338,7 @@ def _parse_authorships(authorships: list[dict[str, Any]]) -> list[dict[str, Any]
                 "affiliations": affiliations,
                 "institutions": institutions,
                 "is_corresponding": bool(authorship.get("is_corresponding")),
+                "author_position": (authorship.get("author_position") or "").strip(),
             }
         )
     return parsed
@@ -681,7 +768,7 @@ def find_top_n_by_citation_window(
     """
     Exact top-N retrieval by citations within ``months`` after publication.
 
-    Implements the threshold-expansion algorithm from ``docs/the_algorithm.md``.
+    Implements the threshold-expansion algorithm from ``docs/pri/the_algorithm.md``.
     """
     reset_citation_cache_stats()
     as_of = as_of or date.today()

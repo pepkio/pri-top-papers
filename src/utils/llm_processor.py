@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Import cache utilities
-from .cache_utils import async_cache
+from .cache_utils import async_cache, llm_async_cache, llm_cache_ttl_seconds
 
 try:
     import openai
@@ -72,6 +72,36 @@ def default_openrouter_model() -> str:
     return (os.getenv("OPENROUTER_MODEL") or "").strip() or OPENROUTER_DEFAULT_MODEL
 
 
+def llm_call_cache_key(func: Callable, args: tuple, kwargs: dict) -> str:
+    """Stable cache key for ``_call_llm`` based on model settings and prompt text."""
+    import hashlib
+
+    processor = args[0]
+    prompt = args[1] if len(args) > 1 else ""
+    system_prompt = args[2] if len(args) > 2 else kwargs.get("system_prompt")
+    use_json_format = kwargs.get("use_json_format")
+    if use_json_format is None:
+        use_json_format = not getattr(processor, "model", "").startswith("nvidia/")
+
+    payload = {
+        "func": func.__name__,
+        "model": getattr(processor, "model", ""),
+        "base_url": str(getattr(getattr(processor, "client", None), "base_url", "")),
+        "temperature": getattr(processor, "temperature", None),
+        "max_tokens": getattr(processor, "max_tokens", None),
+        "reasoning_effort": getattr(processor, "reasoning_effort", None),
+        "provider_order": getattr(processor, "provider_order", None),
+        "provider_routing": getattr(processor, "provider_routing", None),
+        "prompt": prompt,
+        "system_prompt": system_prompt,
+        "use_json_format": use_json_format,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+    return digest
+
+
 class LLMProcessor:
     """
     A processor that uses LLMs to enrich records with extracted information.
@@ -92,6 +122,7 @@ class LLMProcessor:
         max_retries: int = 4,
         retry_backoff: float = 2.0,
         provider_order: Optional[str] = None,
+        provider_routing: Optional[str] = None,
     ):
         """
         Initialize the LLM processor.
@@ -118,6 +149,9 @@ class LLMProcessor:
                 ``allow_fallbacks=true`` so a known-good provider is tried first
                 while still falling back (the existing retry catches any fallback
                 that misbehaves, e.g. truncates a large response at ~8KB).
+            provider_routing: Optional OfoxAI gateway routing strategy (e.g.
+                ``"cost"`` for lowest-cost upstream). When set, sends
+                ``provider.routing`` in ``extra_body``.
         """
         if not OPENAI_AVAILABLE:
             raise ImportError(
@@ -155,7 +189,8 @@ class LLMProcessor:
         else:
             order_str = provider_order.strip()
         self.provider_order = [p.strip() for p in order_str.split(",") if p.strip()]
-        
+        self.provider_routing = (provider_routing or "").strip() or None
+
         # Initialize client (OpenRouter: optional attribution headers)
         client_kwargs: Dict[str, Any] = {
             "api_key": api_key,
@@ -174,14 +209,17 @@ class LLMProcessor:
         
         self.client = AsyncOpenAI(**client_kwargs)
     
-    @async_cache(
+    @llm_async_cache(
         prefix="llm_call",
-        ttl=3600,  # Cache for 1 hour
+        ttl=llm_cache_ttl_seconds(),
+        key_func=llm_call_cache_key,
     )
     async def _call_llm(
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
+        *,
+        use_json_format: Optional[bool] = None,
     ) -> str:
         """
         Call the LLM with a prompt and return the response.
@@ -193,7 +231,9 @@ class LLMProcessor:
         Returns:
             LLM response text
         """
-        request_params = self._build_request_params(prompt, system_prompt)
+        request_params = self._build_request_params(
+            prompt, system_prompt, use_json_format=use_json_format
+        )
 
         # Retry transient failures (truncated/malformed HTTP body, timeouts,
         # connection blips, provider 5xx/429). Non-retryable client errors
@@ -204,7 +244,42 @@ class LLMProcessor:
         for attempt in range(self.max_retries):
             try:
                 response = await self.client.chat.completions.create(**request_params)
-                return response.choices[0].message.content
+                choice = response.choices[0]
+                content = choice.message.content
+                finish_reason = getattr(choice, "finish_reason", None)
+                if content is None or not str(content).strip():
+                    last_error = ValueError("LLM returned empty content")
+                    if attempt == self.max_retries - 1:
+                        break
+                    delay = self.retry_backoff * (2 ** attempt)
+                    if delay > 0:
+                        delay += random.uniform(0.0, 1.0)
+                    print(
+                        f"  [llm] empty response on attempt "
+                        f"{attempt + 1}/{self.max_retries}; retrying in {delay:.1f}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                # Reasoning models can burn max_tokens on reasoning_tokens and cut
+                # the visible JSON mid-string (finish_reason=length). Retry rather
+                # than returning truncated content that fails JSON parse.
+                if finish_reason == "length":
+                    last_error = ValueError(
+                        f"LLM response truncated (finish_reason=length, "
+                        f"max_tokens={self.max_tokens}): {(content or '')[:120]!r}"
+                    )
+                    if attempt == self.max_retries - 1:
+                        break
+                    delay = self.retry_backoff * (2 ** attempt)
+                    if delay > 0:
+                        delay += random.uniform(0.0, 1.0)
+                    print(
+                        f"  [llm] truncated response on attempt "
+                        f"{attempt + 1}/{self.max_retries}; retrying in {delay:.1f}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                return content
             except Exception as exc:
                 last_error = exc
                 if not self._is_retryable_error(exc):
@@ -225,6 +300,8 @@ class LLMProcessor:
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
+        *,
+        use_json_format: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Build the request kwargs sent to chat.completions.create.
 
@@ -237,7 +314,8 @@ class LLMProcessor:
         messages.append({"role": "user", "content": prompt})
 
         # Some models (e.g. DeepInfra's Nemotron) don't support response_format.
-        use_json_format = not self.model.startswith("nvidia/")
+        if use_json_format is None:
+            use_json_format = not self.model.startswith("nvidia/")
 
         request_params: Dict[str, Any] = {
             "model": self.model,
@@ -249,19 +327,23 @@ class LLMProcessor:
             request_params["response_format"] = {"type": "json_object"}
 
         # extra_body is merged into the top-level request JSON by the SDK.
-        # Reasoning effort + OpenRouter provider routing both live here.
+        # Reasoning effort + provider routing (OpenRouter order / Ofox cost) live here.
         extra_body: Dict[str, Any] = {}
         if self.reasoning_effort:
             extra_body["reasoning"] = {"effort": self.reasoning_effort}
+        provider_extra: Dict[str, Any] = {}
         if self.provider_order:
             # Prefer the listed providers but keep allow_fallbacks=true so the
             # request still succeeds if the preferred provider is unavailable; the
             # retry-with-backoff above catches any fallback that returns a truncated
             # body. See docs/pri for the ~8KB truncation investigation.
-            extra_body["provider"] = {
-                "order": list(self.provider_order),
-                "allow_fallbacks": True,
-            }
+            provider_extra["order"] = list(self.provider_order)
+            provider_extra["allow_fallbacks"] = True
+        if self.provider_routing:
+            # OfoxAI extension: route to the lowest-cost upstream node.
+            provider_extra["routing"] = self.provider_routing
+        if provider_extra:
+            extra_body["provider"] = provider_extra
         if extra_body:
             request_params["extra_body"] = extra_body
         return request_params
@@ -315,6 +397,9 @@ class LLMProcessor:
         Returns:
             Parsed JSON dictionary
         """
+        if response_text is None or not str(response_text).strip():
+            raise ValueError("Cannot parse empty LLM response")
+
         # Remove markdown code blocks if present
         text = response_text.strip()
         if text.startswith("```"):
@@ -396,6 +481,59 @@ class LLMProcessor:
         enriched_record.update(extracted_fields)
         
         return enriched_record
+
+    def _record_label(self, record: Dict[str, Any]) -> str:
+        """Short identifier for log messages when a record fails."""
+        for key in ("pmid", "openalex_id", "id", "title"):
+            value = record.get(key)
+            if value:
+                text = str(value).strip()
+                if text:
+                    return text[:80]
+        return "unknown record"
+
+    async def _process_record_with_retry(
+        self,
+        record: Dict[str, Any],
+        prompt_template: str,
+        system_prompt: Optional[str] = None,
+        output_field_names: Optional[List[str]] = None,
+        record_retries: int = 2,
+        skip_failed_records: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Process one record, retrying transient/parse failures before skip or raise."""
+        label = self._record_label(record)
+        last_error: Optional[BaseException] = None
+        attempts = max(1, int(record_retries))
+
+        for attempt in range(attempts):
+            try:
+                return await self.process_record(
+                    record,
+                    prompt_template,
+                    system_prompt,
+                    output_field_names,
+                )
+            except (ValueError, LLMRetryExhausted, TypeError, AttributeError) as exc:
+                last_error = exc
+                if attempt < attempts - 1:
+                    print(
+                        f"  WARNING: LLM failed for {label!r} "
+                        f"(attempt {attempt + 1}/{attempts}); retrying: {exc}"
+                    )
+                    continue
+                if skip_failed_records:
+                    print(
+                        f"  WARNING: Skipping {label!r} after {attempts} "
+                        f"failed attempt(s): {last_error}"
+                    )
+                    return None
+                raise RuntimeError(
+                    f"LLM processing failed for {label!r} after {attempts} attempt(s): "
+                    f"{last_error}"
+                ) from last_error
+
+        return None
     
     async def process_records(
         self,
@@ -406,12 +544,14 @@ class LLMProcessor:
         batch_size: int = 1,
         max_concurrent: int = 5,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        record_retries: int = 2,
+        skip_failed_records: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Process a list of records with the LLM.
 
         Processes records one by one (or in small batches) and adds extracted fields
-        to each record. The output list has the same length as the input list.
+        to each record.
 
         Args:
             records: List of dictionaries to process
@@ -421,20 +561,30 @@ class LLMProcessor:
             batch_size: Number of records to include in each LLM call (default: 1, process individually)
             max_concurrent: Maximum number of concurrent LLM calls (default: 5)
             progress_callback: Optional callback function called with (completed, total) after each record
+            record_retries: Per-record attempts (incl. first) before skip or raise (default: 2)
+            skip_failed_records: If True, omit records that still fail after record_retries
 
         Returns:
-            List of enriched records (same length as input)
+            List of enriched records. When skip_failed_records is False, same length as input.
+            When True, failed records are omitted (list may be shorter than input).
         """
         if batch_size == 1:
             # Process records individually with concurrency control
             semaphore = asyncio.Semaphore(max_concurrent)
             completed = 0
 
-            async def process_with_semaphore(record: Dict[str, Any]) -> Dict[str, Any]:
+            async def process_with_semaphore(
+                record: Dict[str, Any],
+            ) -> Optional[Dict[str, Any]]:
                 nonlocal completed
                 async with semaphore:
-                    result = await self.process_record(
-                        record, prompt_template, system_prompt, output_field_names
+                    result = await self._process_record_with_retry(
+                        record,
+                        prompt_template,
+                        system_prompt,
+                        output_field_names,
+                        record_retries=record_retries,
+                        skip_failed_records=skip_failed_records,
                     )
                     completed += 1
                     if progress_callback:
@@ -442,7 +592,10 @@ class LLMProcessor:
                     return result
 
             tasks = [process_with_semaphore(record) for record in records]
-            return await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks)
+            if skip_failed_records:
+                return [result for result in results if result is not None]
+            return results  # type: ignore[return-value]
         else:
             # Process in batches
             enriched_records = []
@@ -497,6 +650,8 @@ async def process_records_with_llm(
     batch_size: int = 1,
     max_concurrent: int = 5,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    record_retries: int = 2,
+    skip_failed_records: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Convenience function to process records with LLM.
@@ -517,9 +672,11 @@ async def process_records_with_llm(
         batch_size: Number of records per LLM call (default: 1)
         max_concurrent: Maximum concurrent LLM calls (default: 5)
         progress_callback: Optional callback function called with (completed, total) after each record
+        record_retries: Per-record attempts before skip or raise (default: 2)
+        skip_failed_records: If True, omit records that still fail after record_retries
     
     Returns:
-        List of enriched records (same length as input)
+        List of enriched records (shorter than input when skip_failed_records is True)
     
     Example:
         >>> records = [
@@ -548,5 +705,7 @@ async def process_records_with_llm(
         batch_size=batch_size,
         max_concurrent=max_concurrent,
         progress_callback=progress_callback,
+        record_retries=record_retries,
+        skip_failed_records=skip_failed_records,
     )
 

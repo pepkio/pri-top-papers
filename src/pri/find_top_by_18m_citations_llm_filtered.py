@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Find top papers by 18m citations, filtered by LLM topic-relevance check.
+Find top papers by 18m citations, filtered by LLM topic-relevance and paper-type check.
 
 Fetches an oversized candidate pool from OpenAlex, classifies each paper with an LLM,
-and returns the top N papers that are substantively about the target topic.
+and returns the top N on-topic research articles.
 
 Example:
     uv run python src/pri/find_top_by_18m_citations_llm_filtered.py \\
@@ -32,13 +32,17 @@ from pri.openalex_client import (
     resolve_topic_id,
     validate_topic,
 )
-from utils.llm_processor import LLMProcessor, LLMRetryExhausted
+from pri.pri_llm_fallbacks import build_paper_text_attempts
+from pri.pri_llm_provider import build_llm_processor, resolve_pri_llm_config
+from utils.cache_utils import set_llm_cache_disabled
+from utils.llm_processor import LLMRetryExhausted
 
 DEFAULT_LIMIT = 20
-DEFAULT_INITIAL_MULTIPLIER = 1.5
+DEFAULT_INITIAL_MULTIPLIER = 1.8
 DEFAULT_MAX_MULTIPLIER = 5.0
-DEFAULT_CITATION_INITIAL_MULTIPLIER = DEFAULT_INITIAL_MULTIPLIER
+DEFAULT_CITATION_INITIAL_MULTIPLIER = 1.5
 DEFAULT_MAX_CONCURRENT = 5
+DEFAULT_POOL_INCREMENT = 25
 DEFAULT_MULTIPLIER_LADDER = [1.5, 2.0, 3.0, 4.0, 5.0]
 
 TOPIC_RELEVANCE_PROMPT_TEMPLATE = """\
@@ -60,37 +64,28 @@ You are a scientific literature classifier. Your task is to decide whether a sch
 - Review papers count as `true` when the review substantially covers the topic.
 - If the abstract is missing or very short, use the title to make your best judgment.
 
+## Paper type
+Also set `is_research_article`: `true` for original research, Methods / Software or Clinical Trials; `false` for reviews, meta-analyses, editorials, or commentaries.
+
 ## Output
 Respond with a single JSON object only. No markdown, no explanation, and no extra keys.
 
 ```json
-{{"is_about_the_topic": true}}
-```
-
-or
-
-```json
-{{"is_about_the_topic": false}}
+{{"is_about_the_topic": true, "is_research_article": true}}
 ```
 """
 
 TOPIC_RELEVANCE_SYSTEM_PROMPT = (
     "You are a scientific literature classifier. "
-    "Respond with a single valid JSON object containing only the key "
-    '"is_about_the_topic" with a boolean value. '
+    "Respond with a single valid JSON object with keys "
+    '"is_about_the_topic" and "is_research_article" (boolean values). '
     "No markdown, no explanation, no extra keys."
 )
 
 
 def default_topic_filter_model() -> str:
-    """Model for topic relevance checks from OPENROUTER_PRI_TOPIC_CHECK_MODEL."""
-    model = (os.getenv("OPENROUTER_PRI_TOPIC_CHECK_MODEL") or "").strip()
-    if not model:
-        raise ValueError(
-            "OPENROUTER_PRI_TOPIC_CHECK_MODEL is required for topic relevance checks. "
-            "Set it in .env."
-        )
-    return model
+    """Model for topic relevance checks from the configured PRI LLM provider."""
+    return resolve_pri_llm_config("topic_check").model
 
 
 def build_multiplier_ladder(
@@ -112,6 +107,38 @@ def build_multiplier_ladder(
     return sorted(set(result))
 
 
+def build_pool_size_ladder(
+    n: int,
+    initial_multiplier: float,
+    max_multiplier: float,
+    *,
+    increment: int = DEFAULT_POOL_INCREMENT,
+    multiplier_ladder: list[float] | None = None,
+) -> list[int]:
+    """Return candidate pool sizes for each LLM-filter escalation step.
+
+    By default, starts at ceil(initial_multiplier * n) and adds ``increment``
+    papers per step until ceil(max_multiplier * n). For n=50 this yields
+    100, 125, … up to 250. Pass ``multiplier_ladder`` to use explicit
+    multiplier steps instead (legacy behavior).
+    """
+    if multiplier_ladder is not None:
+        multipliers = build_multiplier_ladder(
+            initial_multiplier, max_multiplier, ladder=multiplier_ladder
+        )
+        return [max(n, math.ceil(m * n)) for m in multipliers]
+
+    initial = max(n, math.ceil(initial_multiplier * n))
+    maximum = max(n, math.ceil(max_multiplier * n))
+    sizes = [initial]
+    current = initial
+    while current < maximum:
+        current = min(current + increment, maximum)
+        if current > sizes[-1]:
+            sizes.append(current)
+    return sizes
+
+
 def build_relevance_prompt(
     topic: str,
     title: str,
@@ -128,7 +155,7 @@ def build_relevance_prompt(
     )
 
 
-def coerce_is_about_the_topic(value: Any) -> bool:
+def coerce_bool_field(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -142,10 +169,27 @@ def coerce_is_about_the_topic(value: Any) -> bool:
     return False
 
 
-def _validate_topic_relevance_fields(fields: dict[str, Any]) -> bool:
+def _parse_classification_fields(fields: dict[str, Any]) -> tuple[bool, bool]:
     if "is_about_the_topic" not in fields:
         raise ValueError("LLM response missing 'is_about_the_topic'")
-    return coerce_is_about_the_topic(fields["is_about_the_topic"])
+    if "is_research_article" not in fields:
+        raise ValueError("LLM response missing 'is_research_article'")
+    return (
+        coerce_bool_field(fields["is_about_the_topic"]),
+        coerce_bool_field(fields["is_research_article"]),
+    )
+
+
+def work_passes_llm_filter(
+    work: dict[str, Any],
+    *,
+    research_articles_only: bool = True,
+) -> bool:
+    if not work.get("is_about_the_topic"):
+        return False
+    if research_articles_only and not work.get("is_research_article"):
+        return False
+    return True
 
 
 def _work_sort_key(work: dict[str, Any]) -> tuple[int, int]:
@@ -164,19 +208,21 @@ async def filter_works_by_topic_llm(
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
     progress_callback: Callable[[int, int], None] | None = None,
     llm_enricher: Callable[[list[dict[str, Any]], str], Any] | None = None,
+    strict: bool = False,
 ) -> list[dict[str, Any]]:
-    """LLM-classify each work; merge is_about_the_topic into work dicts."""
+    """LLM-classify each work; merge topic and paper-type fields into work dicts."""
     if not works:
         return []
 
     if llm_enricher is not None:
         return await llm_enricher(works, topic_label)
 
-    processor = LLMProcessor(
-        model=model or default_topic_filter_model(),
+    llm_config = resolve_pri_llm_config(
+        "topic_check",
+        model=model,
         base_url=base_url,
-        max_tokens=64,
     )
+    processor = build_llm_processor(llm_config, max_tokens=64)
     semaphore = asyncio.Semaphore(max_concurrent)
     completed = 0
     total = len(works)
@@ -184,23 +230,40 @@ async def filter_works_by_topic_llm(
     async def classify_one(work: dict[str, Any]) -> dict[str, Any]:
         nonlocal completed
         async with semaphore:
-            prompt = build_relevance_prompt(
-                topic_label,
-                work.get("title") or "",
-                work.get("abstract") or "",
-            )
+            title = work.get("title") or ""
+            abstract = work.get("abstract") or ""
             work_id = work.get("openalex_id") or "unknown"
-            title_preview = (work.get("title") or "")[:80]
+            title_preview = title[:80]
             is_about_the_topic: bool | None = None
+            is_research_article: bool | None = None
+            classification_note: str | None = None
             last_error: BaseException | None = None
+            attempts = build_paper_text_attempts(title, abstract)
+            first_mode = attempts[0].mode
 
-            for attempt in range(2):
+            for attempt in attempts:
+                prompt = build_relevance_prompt(
+                    topic_label,
+                    attempt.title,
+                    attempt.abstract,
+                )
                 try:
                     response_text = await processor._call_llm(
-                        prompt, TOPIC_RELEVANCE_SYSTEM_PROMPT
+                        prompt,
+                        TOPIC_RELEVANCE_SYSTEM_PROMPT,
+                        use_json_format=attempt.use_json_format,
                     )
                     fields = processor._parse_json_response(response_text or "")
-                    is_about_the_topic = _validate_topic_relevance_fields(fields)
+                    is_about_the_topic, is_research_article = _parse_classification_fields(
+                        fields
+                    )
+                    if attempt.mode != first_mode:
+                        classification_note = attempt.mode
+                        print(
+                            "  Warning: used "
+                            f"{attempt.mode.replace('_', '-')} topic classification for "
+                            f"{work_id!r} ({title_preview!r}) after full-abstract LLM failures"
+                        )
                     break
                 except (
                     ValueError,
@@ -209,20 +272,33 @@ async def filter_works_by_topic_llm(
                     LLMRetryExhausted,
                 ) as exc:
                     last_error = exc
-                    if attempt == 0:
-                        continue
+                    continue
+
+            if is_about_the_topic is None:
+                if strict:
                     raise RuntimeError(
                         f"Topic relevance LLM failed for {work_id!r} "
-                        f"({title_preview!r}) after retry: {exc}"
-                    ) from exc
+                        f"({title_preview!r}) after fallbacks: {last_error}"
+                    ) from last_error
+                classification_note = "failed"
+                is_about_the_topic = False
+                is_research_article = False
+                print(
+                    f"  Warning: topic classification failed for {work_id!r} "
+                    f"({title_preview!r}); treating as not on-topic"
+                )
 
             completed += 1
             if progress_callback:
                 progress_callback(completed, total)
-            return {
+            result = {
                 **work,
                 "is_about_the_topic": is_about_the_topic,
+                "is_research_article": is_research_article,
             }
+            if classification_note:
+                result["classification_note"] = classification_note
+            return result
 
     return list(await asyncio.gather(*[classify_one(work) for work in works]))
 
@@ -248,23 +324,30 @@ def fetch_and_filter_top_n(
     llm_enricher: Callable[[list[dict[str, Any]], str], Any] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     multiplier_ladder: list[float] | None = None,
+    pool_increment: int = DEFAULT_POOL_INCREMENT,
+    strict: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """
-    Fetch candidates with escalating pool multipliers until >= n papers pass LLM filter.
+    Fetch candidates with escalating pool sizes until >= n papers pass LLM filter.
+
+    A paper passes when it is on-topic and, if articles_only is True, classified as a
+    research article by the LLM.
 
     Returns (top_n_works, evaluation_pool, combined_metadata).
     """
     fetch = fetch_fn or find_top_n_by_citation_window
-    multipliers = build_multiplier_ladder(
-        initial_multiplier, max_multiplier, ladder=multiplier_ladder
+    pool_sizes = build_pool_size_ladder(
+        n,
+        initial_multiplier,
+        max_multiplier,
+        increment=pool_increment,
+        multiplier_ladder=multiplier_ladder,
     )
     evaluated_by_id: dict[str, dict[str, Any]] = {}
     last_openalex_metadata: dict[str, Any] = {}
-    multiplier_used = multipliers[0]
     pool_size_fetched = 0
 
-    for multiplier in multipliers:
-        pool_size = max(n, math.ceil(multiplier * n))
+    for pool_size in pool_sizes:
         works, openalex_metadata = fetch(
             query=query,
             n=pool_size,
@@ -277,7 +360,6 @@ def fetch_and_filter_top_n(
             use_cache=use_cache,
         )
         last_openalex_metadata = openalex_metadata
-        multiplier_used = multiplier
         pool_size_fetched = pool_size
 
         new_works = [
@@ -293,6 +375,7 @@ def fetch_and_filter_top_n(
                     max_concurrent=max_concurrent,
                     progress_callback=progress_callback,
                     llm_enricher=llm_enricher,
+                    strict=strict,
                 )
             )
             for work in enriched:
@@ -301,16 +384,31 @@ def fetch_and_filter_top_n(
         passed = [
             work
             for work in sorted(evaluated_by_id.values(), key=_work_sort_key, reverse=True)
-            if work.get("is_about_the_topic")
+            if work_passes_llm_filter(work, research_articles_only=articles_only)
         ]
         if len(passed) >= n:
             break
 
     evaluation_pool = sorted(evaluated_by_id.values(), key=_work_sort_key, reverse=True)
-    passed_works = [work for work in evaluation_pool if work.get("is_about_the_topic")]
+    passed_works = [
+        work
+        for work in evaluation_pool
+        if work_passes_llm_filter(work, research_articles_only=articles_only)
+    ]
     top_works = passed_works[:n]
     sufficient = len(passed_works) >= n
 
+    llm_config = resolve_pri_llm_config("topic_check", model=model, base_url=base_url)
+    fallback_count = sum(
+        1
+        for work in evaluation_pool
+        if work.get("classification_note") not in (None, "failed")
+    )
+    failed_count = sum(
+        1 for work in evaluation_pool if work.get("classification_note") == "failed"
+    )
+    multiplier_ladder_meta = [pool_size / n for pool_size in pool_sizes]
+    multiplier_used = pool_size_fetched / n
     llm_filter_meta = {
         "topic_label": topic_label,
         "target_n": n,
@@ -318,9 +416,11 @@ def fetch_and_filter_top_n(
         "max_multiplier": max_multiplier,
         "llm_pool_initial_multiplier": initial_multiplier,
         "llm_pool_max_multiplier": max_multiplier,
-        "multiplier_ladder": multipliers,
+        "pool_size_ladder": pool_sizes,
+        "pool_increment": pool_increment if multiplier_ladder is None else None,
+        "multiplier_ladder": multiplier_ladder_meta,
         "multiplier_used": multiplier_used,
-        "llm_pool_multiplier_ladder": multipliers,
+        "llm_pool_multiplier_ladder": multiplier_ladder_meta,
         "llm_pool_multiplier_used": multiplier_used,
         "citation_initial_multiplier": citation_initial_multiplier,
         "pool_size_fetched": pool_size_fetched,
@@ -328,7 +428,12 @@ def fetch_and_filter_top_n(
         "passed_count": len(passed_works),
         "rejected_count": len(evaluation_pool) - len(passed_works),
         "sufficient": sufficient,
-        "model": model or default_topic_filter_model(),
+        "provider": llm_config.provider,
+        "model": llm_config.model,
+        "base_url": llm_config.base_url,
+        "papers_with_fallback_classification": fallback_count,
+        "papers_with_failed_classification": failed_count,
+        "research_articles_only": articles_only,
     }
 
     metadata = {
@@ -395,6 +500,7 @@ def _write_markdown_filtered(path: str, works: list[dict], metadata: dict) -> No
                 f"### {idx}. {work.get('title', '')}",
                 "",
                 f"- **On topic (LLM):** {work.get('is_about_the_topic')}",
+                f"- **Research article (LLM):** {work.get('is_research_article')}",
                 f"- **Citations within {window_months} months:** {work.get('citations_within_window')}",
                 f"- **Total citations (OpenAlex):** {work.get('cited_by_count')}",
                 f"- **Authors:** {work.get('authors')}",
@@ -496,9 +602,19 @@ def main() -> None:
         help="Skip citation-window count cache",
     )
     parser.add_argument(
+        "--no-llm-cache",
+        action="store_true",
+        help="Disable local LLM response cache (stored under .cache/llm/)",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail immediately if topic classification cannot be completed for a paper",
+    )
+    parser.add_argument(
         "--model",
         default=None,
-        help="LLM model (default: OPENROUTER_PRI_TOPIC_CHECK_MODEL from .env)",
+        help="LLM model (default: from PRI_TOPIC_CHECK_CONCEPT_EXTRACT_MODEL_PROVIDER in .env)",
     )
     parser.add_argument("--base-url", default=None, help="LLM API base URL")
     parser.add_argument(
@@ -508,6 +624,9 @@ def main() -> None:
         help=f"Max concurrent LLM calls (default: {DEFAULT_MAX_CONCURRENT})",
     )
     args = parser.parse_args()
+
+    if args.no_llm_cache:
+        set_llm_cache_disabled(True)
 
     topic_id: str | None = None
     topic_display_name: str | None = None
@@ -562,6 +681,7 @@ def main() -> None:
         base_url=args.base_url,
         max_concurrent=args.max_concurrent,
         progress_callback=llm_progress,
+        strict=args.strict,
     )
 
     if args.topic:
@@ -573,7 +693,7 @@ def main() -> None:
     llm_filter = metadata.get("llm_filter") or {}
     if not llm_filter.get("sufficient"):
         print(
-            f"WARNING: Only {llm_filter.get('passed_count', 0)} on-topic papers found "
+            f"WARNING: Only {llm_filter.get('passed_count', 0)} qualifying papers found "
             f"(target N={args.limit}). Returning all that passed."
         )
 
@@ -592,7 +712,7 @@ def main() -> None:
 
     print(
         f"Evaluated {llm_filter.get('evaluated_total', 0)} papers; "
-        f"{llm_filter.get('passed_count', 0)} on-topic; "
+        f"{llm_filter.get('passed_count', 0)} passed LLM filter; "
         f"LLM pool multiplier used={llm_filter.get('llm_pool_multiplier_used')}; "
         f"citation kN multiplier={llm_filter.get('citation_initial_multiplier')}"
     )

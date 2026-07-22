@@ -12,9 +12,9 @@ Every published leaderboard can be audited from the tool's output:
 - **Fixed comparison window** — All papers in a cohort are evaluated with the same post-publication window (default: 18 months). Only papers that have completed the full window are eligible.
 - **Full audit trail** — Output JSON includes:
   - `works` — the final ranked list returned to the user
-  - `evaluation_pool` — every candidate paper sent to the LLM classifier, with `is_about_the_topic` for each
+  - `evaluation_pool` — every candidate paper sent to the LLM classifier, with `is_about_the_topic` and `is_research_article` for each
   - `metadata` — OpenAlex query parameters, multiplier ladder used, pool sizes, LLM model name, and pass/reject counts
-- **Open classification rules** — The topic-relevance prompt (`TOPIC_RELEVANCE_PROMPT_TEMPLATE` in source) defines exactly how papers are judged on-topic or off-topic.
+- **Open classification rules** — The topic-relevance prompt (`TOPIC_RELEVANCE_PROMPT_TEMPLATE` in source) defines exactly how papers are judged on-topic or off-topic, and whether each paper counts as a research article.
 
 You can verify every ranking decision: which papers were considered, how they were classified, and which citation counts determined their rank.
 
@@ -57,11 +57,11 @@ The `--citation-initial-multiplier` flag controls the initial candidate set size
 
 ### 2. Topic relevance filter (LLM)
 
-An LLM classifies each candidate paper as on-topic or off-topic for the target research area. The tool returns the top *N* **on-topic** papers, still ranked by 18-month citations.
+An LLM classifies each candidate paper as on-topic or off-topic for the target research area, and whether it is a research article (vs. review, editorial, etc.). The tool returns the top *N* **on-topic research articles**, still ranked by 18-month citations.
 
 Two separate multipliers control pool sizing:
 
-- `--initial-multiplier` / `--max-multiplier` — control the LLM evaluation pool. For `-n 50` and the default initial multiplier `1.5`, the tool fetches the exact top 75 papers by 18-month citations, then LLM-filters them for topic relevance. If fewer than 50 pass, it escalates through the multiplier ladder up to the max multiplier.
+- `--initial-multiplier` / `--max-multiplier` — control the LLM evaluation pool. For `-n 50` and the default initial multiplier `1.8`, the tool fetches the exact top 90 papers by 18-month citations, then LLM-filters them for topic relevance. If fewer than 50 pass, it escalates by adding 25 papers per step up to the max multiplier (250 for n=50).
 - `--citation-initial-multiplier` — controls the internal threshold-expansion algorithm when computing exact 18-month citation ranks for whatever LLM pool size was requested.
 
 ## Configuration
@@ -70,12 +70,12 @@ Copy `.env.example` to `.env` and set:
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `OPENROUTER_PRI_TOPIC_CHECK_MODEL` | Yes | LLM model for topic relevance checks (OpenRouter slug, e.g. `openai/gpt-4o-mini`) |
+| `PRI_TOPIC_CHECK_CONCEPT_EXTRACT_MODEL_PROVIDER` | No | LLM provider: `openrouter` (default), `ofox`, or `n1n` |
+| `OPENROUTER_PRI_TOPIC_CHECK_MODEL` | Yes* | LLM model for topic relevance checks (OpenRouter slug, e.g. `openai/gpt-4o-mini`) |
 | `OPENROUTER_API_KEY` | Yes* | LLM API access via OpenRouter |
-| `OPENAI_API_KEY` | Yes* | Alternative LLM API key if not using OpenRouter |
 | `OPENALEX_API_KEY` | No | Improves OpenAlex rate limits |
 
-\* At least one of `OPENROUTER_API_KEY` or `OPENAI_API_KEY` is required.
+\* When using OpenRouter (default). For Ofox or N1N, set the corresponding `OFOX_*` or `N1N_*` model and API key variables instead.
 
 Optional:
 
@@ -85,8 +85,12 @@ Optional:
 | `OPENROUTER_PROVIDER_ORDER` | Comma-separated OpenRouter upstream providers to prefer |
 | `OPENROUTER_HTTP_REFERER` | Attribution header for OpenRouter |
 | `OPENROUTER_APP_TITLE` | Attribution header for OpenRouter |
+| `OFOX_BASE_URL`, `OFOX_PROVIDER_ROUTING` | Ofox provider settings |
+| `N1N_BASE_URL` | N1N provider base URL |
+| `LLM_CACHE_DISABLED` | Set to `1` to disable LLM response caching |
+| `LLM_CACHE_TTL_SECONDS` | LLM cache TTL in seconds (default: 604800 = 7 days) |
 
-LLM responses are cached under `.cache/` (1-hour TTL) to avoid redundant API calls on re-runs. OpenAlex citation-window counts are cached in `.cache/openalex_citation_window.json` (7-day TTL). Use `--no-cache` to skip the citation cache.
+LLM responses are cached under `.cache/llm/` (7-day TTL by default) to avoid redundant API calls on re-runs. OpenAlex citation-window counts are cached in `.cache/openalex_citation_window.json` (7-day TTL). Use `--no-cache` to skip the citation cache, or `--no-llm-cache` to skip the LLM cache.
 
 ## CLI reference
 
@@ -97,7 +101,7 @@ LLM responses are cached under `.cache/` (1-hour TTL) to avoid redundant API cal
 | `--from-date` | Start of publication date range (`YYYY-MM-DD`) **(required)** |
 | `--to-date` | End of publication date range (`YYYY-MM-DD`) **(required)** |
 | `--limit`, `-n` | Number of top on-topic papers to return (default: 20) |
-| `--initial-multiplier` | First LLM candidate pool size multiplier (default: 1.5) |
+| `--initial-multiplier` | First LLM candidate pool size multiplier (default: 1.8) |
 | `--max-multiplier` | Maximum LLM pool multiplier before giving up (default: 5.0) |
 | `--citation-initial-multiplier` | Initial *kN* multiplier for the exact citation-ranking algorithm (default: 1.5) |
 | `--window-months` | Citation window in months (default: 18) |
@@ -106,7 +110,9 @@ LLM responses are cached under `.cache/` (1-hour TTL) to avoid redundant API cal
 | `--output-dir` | Directory for JSON and Markdown output (default: `results/<year>/<topic_slug>/`) |
 | `--include-reviews` | Include reviews and other non-article types |
 | `--no-cache` | Skip citation-window count cache |
-| `--model` | Override LLM model (default: `OPENROUTER_PRI_TOPIC_CHECK_MODEL`) |
+| `--no-llm-cache` | Disable local LLM response cache |
+| `--strict` | Fail immediately if topic classification cannot be completed for a paper |
+| `--model` | Override LLM model (default: from provider env vars) |
 | `--base-url` | Override LLM API base URL |
 | `--max-concurrent` | Max concurrent LLM calls (default: 5) |
 
@@ -122,7 +128,7 @@ LLM responses are cached under `.cache/` (1-hour TTL) to avoid redundant API cal
 }
 ```
 
-Each work entry includes fields such as `title`, `abstract`, `authors`, `journal`, `publication_date`, `doi`, `openalex_id`, `openalex_url`, `citations_within_window`, `citation_window_end`, and (in `evaluation_pool`) `is_about_the_topic`.
+Each work entry includes fields such as `title`, `abstract`, `authors`, `journal`, `publication_date`, `doi`, `openalex_id`, `openalex_url`, `citations_within_window`, `citation_window_end`, and (in `evaluation_pool`) `is_about_the_topic` and `is_research_article`.
 
 The `metadata.llm_filter` block records the multiplier ladder, pool size fetched, evaluated/passed/rejected counts, LLM model used, and whether the target N was reached.
 
